@@ -1,0 +1,273 @@
+---
+title: "hw3-nc7"
+output: pdf_document
+author: "Nicholas Chen"
+---
+```{r setup, include=FALSE}
+library(fmlr)
+library(lubridate)
+library(fracdiff)
+library(TTR)
+library(randomForest)
+library(ROCR)
+```
+
+# 1. Fractional Differentiation
+```{r fracdiff}
+
+
+fracDiff = function(datc, d=.5, tau=.001){
+  w_n = 1
+  w = 1
+  while (abs(w_n) > tau && length(w) < length(datc)){
+    k = length(w)
+    w_n = -1*w_n*(d-k+1)/k
+    if (abs(w_n) > tau){
+      w = c(w,w_n)
+    }
+  }
+  
+  fracD = rep(0, length(datc))
+  
+  for(i in 1:length(datc)){
+    temp = 0
+    for(j in 1:length(w)){
+      if (j==i){break}
+      temp = temp + datc[i-j+1] * w[j]
+    }
+    fracD[i] = temp
+  }
+  
+  fracD[length(w):length(fracD)]
+  
+}
+
+dat = read.csv("../datasets/unit_bar_XBTUSD_all.csv", header = T)
+
+fracD = fracDiff(dat$C, d = .5, tau = .001)
+first_order = fracDiff(dat$C, d = 1, tau= .001)
+cor(fracD, dat$C[-(1:(length(dat$C)-length(fracD)))])
+cor(first_order, dat$C[-(1:(length(dat$C)-length(first_order)))])
+```
+
+Implementation of fractional differentiation - a method of achieving stationary data while preserving some amount of memory for predictive power.  Starting with $w_0 = 1$, iteratively compute $w_k = -w_{k-1}*(d-k+1/k)$, which decays to 0 as k approaches infinitely.  
+
+First order differentiation is just the special case of $d=1$, so we can derive it via the same function.  Comparing the two correlation coefficients, we see that the first_order correlation is almost negligible, while fractional differentiation with $d=.5$ maintains a very high correlation with close prices.  This is exactly what we would expect by design; fractional differentiation preserves some amount of historical memory of price trends, while first order differentiation discards it entirely.
+
+\pagebreak
+
+# 2. Unit Root and KPSS tests
+```{r memvsd}
+
+cor_vals = c()
+i_vals = c()
+for(i in 1:100){
+  i=i/100
+  fracD = fracDiff(dat$C, i, .0001)
+  cor_vals = c(cor_vals,cor(fracD, dat$C[-(1:(length(dat$C)-length(fracD)))]))
+  i_vals = c(i_vals, i)
+}
+
+plot(i_vals, cor_vals, main = 'Memory vs. d', xlab = 'd', ylab = 'cor (memory)')
+```
+
+I generated fractionally differentiated features for $d\in[0,1]$ with $\tau = .0001$ and computed correlation coefficients, representing memory preserved, with raw closed prices.  As depicted above, memory decreases monotonically as d increases.  This means that we want to take the smallest possible value of d such that we have a stationary distribution.
+
+
+```{r unitroot}
+min_d_adf = 0
+for(i in 1:100){
+  i = i/100
+  fracD = fracDiff(dat$C, i, .0001)
+  if (urca::ur.df(fracD)@teststat[1] < -2.9){
+    min_d_adf = i
+    break
+  }
+}
+
+min_d_ers = 0
+for(i in 1:100){
+  i = i/100
+  fracD = fracDiff(dat$C, i, .0001)
+  if (urca::ur.ers(fracD)@teststat[1] < -2.9){
+    min_d_ers = i
+    break
+  }
+}
+
+min_d_kpss = 0
+for(i in 1:100){
+  i = i/100
+  fracD = fracDiff(dat$C, i, .0001)
+  if (suppressWarnings(tseries::kpss.test(fracD)$p.value > .05)){
+    min_d_kpss = i
+    break
+  }
+}
+
+min_d_adf
+min_d_ers
+min_d_kpss
+
+```
+
+Here I iteratively search for the lowest possible values for d that yields a p-value less than .05 on the augmented Dickey Fuller test (ADF) and Elliot, Rothenberg, and Stock's test, along with a p-value greater than .05 on the KPSS test.  By these results, we would need $d=.91$ in order to pass the KPSS test, but at that point we would preserve almost no memory at all; it's virtually first order differentiation.  The massive gap between the second and third test results - .35 for ADF and .91 for KPSS - means that the tests conflict for an extremely wide range of d-values, and a possible structural break.  Because .91 seems absurdly high, I will use $d=.35$ which passes a majority (2/3) of the tests in order to preserve more memory.
+
+#3. CUSUM Filtering and metalabeling
+```{r CUSUM}
+
+cusum <- function(dat, h){
+  
+  d_p = rep(0, length(dat))
+  
+  for( i in 2:length(d_p)){
+    d_p[i] = dat[i]-dat[i-1]
+  }
+  
+  s_plus = 0
+  s_minus = 0
+  samples = rep(0,length(dat))
+  for(i in 1:length(d_p)){
+    s_plus = s_plus + d_p[i]
+    s_minus = s_minus + d_p[i]
+    s_plus = max(s_plus, 0)
+    s_minus = min(s_minus, 0)
+    
+    if (s_plus > h){
+      samples[i] = 1
+      s_plus = 0
+      s_minus = 0
+    }
+    
+    if (s_minus < -1 * h){
+      samples[i] = 1
+      s_plus = 0
+      s_minus = 0
+    }
+  }
+  which(samples > 0)
+}
+
+triple_barrier <- function(dat, pts1 = c(1,1), t1 = 7, trgt = 1.5){
+  n = as.integer(length(dat)/t1)
+  labels = rep(0,n)
+  break_idx = rep(-1,n)
+  closes = rep(0,n)
+  for (i in 1:n){
+    start_idx = (i-1)*t1 + 1
+    start_p = dat[start_idx]
+    for (j in start_idx:min(length(dat),start_idx+t1)){
+      if (dat[j]>(start_p+pts1[1]*trgt)){
+        labels[i] = 1
+        break_idx[i] = j
+        break
+      }
+      
+      if (dat[j]<(start_p-pts1[2]*trgt)){
+        labels[i] = -1
+        break_idx[i] = j
+        break
+      }
+    }
+    
+    if (labels[i] == 0){
+      break_idx[i] = j
+    }
+    closes[i] = dat[j]
+  }
+  list(l=labels,i=break_idx, c = closes)
+}
+
+h = 200
+cusum_idx = cusum(dat$C, h) 
+
+d = .3
+fracD = fracDiff(dat$C, d, .0001)
+fracDV = fracDiff(dat$C, d, .0001)
+c_prices = rep(0, length(cusum_idx))
+c_fracD = rep(0, length(cusum_idx))
+
+
+c_prices = dat$C[cusum_idx]
+c_fracD = fracD[cusum_idx]
+t=100
+labels = triple_barrier(c_prices, trgt=t)
+
+metalabels = rep(0, length(labels[['l']]))
+for(i in 1:length(metalabels)){
+  if(labels[['l']][i] == 1){
+    metalabels[i]=1
+  }
+}
+metalabels = as.factor(metalabels)
+
+```
+ 
+Reusing code from previous assignment for this week. Apply CUSUM filter and then generate metalabels using the triple barrier method.  After some iterative experimentation, I found that h=200 generated a good number of bars and trgt=100 reduced the number of windows that reached a vertical barrier.
+
+
+#4. Classification with Bagged Classification Trees (Random Forest)
+```{r rf}
+HLC = function(df){
+  df[,c('H','L','C')]
+}
+features = data.frame(
+  y=metalabels,
+  fracD = c_fracD[labels$i], 
+  fracDV = fracDV[labels$i],
+  ADX = ADX(dat)[labels$i,4],
+  aroon = aroon(dat$C)[labels$i,3],
+  bb = BBands(HLC(dat))[labels$i,1],
+  cc = CCI(HLC(dat))[labels$i],
+  chaikinAD=chaikinAD(HLC(dat), dat$V)[labels$i],
+  CMF=CMF(HLC(dat), dat$V)[labels$i],
+  donch = DonchianChannel(dat$C)[labels$i],
+  gmma = GMMA(dat$C)[labels$i],
+  momentum=momentum(dat$C)[labels$i],
+  VWAP=VWAP(dat$C, volume=dat$V)[labels$i],
+  vola=volatility(dat)[labels$i],
+  williamsAD=williamsAD(HLC(dat))[labels$i],
+  ZigZag=ZigZag(HLC(dat))[labels$i]
+            )
+features = features[complete.cases(features),]
+
+par(mfrow=c(1,1))
+i = as.integer(dim(features)[1]/3) * 2
+train = features[1:i,]
+test = features[-(1:i),]
+
+x = randomForest(subset(train,select = c(bb,cc,aroon,fracDV,fracD)), y=train$y, 
+                 xtest = subset(test,select = c(bb,cc,aroon,fracDV,fracD)), ytest = test$y,
+                 importance = TRUE)
+
+varImpPlot(x)
+```
+
+I used the TTR package Professor Hua showed in class to calculate a bunch of financial metrics that I've never heard of.  I then used a combination of single feature importance and mean decreased accuracy to prune all but the most successful features.  
+
+```{r results}
+x$test$confusion
+
+predictions = as.vector(x$test$votes[,2])
+pred = prediction(predictions,test$y)
+perf_AUC = performance(pred, "auc")
+auc = perf_AUC@y.values[[1]]
+auc
+
+
+
+perf = performance(pred, "tpr","fpr")
+plot.new()
+suppressWarnings(plot(perf@x.values[[1]], perf@y.values[[1]], main = 'ROC Curve', col = 'blue',add=TRUE, xlab = 'False Positive', ylab = 'True Positive')) 
+abline(c(0,0), c(1,1))
+
+```
+
+
+
+
+The resulting confusion matrix shows that our classifier was much better at classifying 0 than 1, but it still achieved 50% accuracy for 1, and an 80% accuracy for 0, the larger class.  Note that we had 14 labels of 1, which satisfies the minimum requirement.
+
+Our AUC was .66 which satisfies its corresponding requirement as well, with a test accuracy of .686.
+
+In comparison, random guessing would achieve 50% accuracy for binary classification, which is significantly worse.  Majority guess would label everything as class 0, which would achieve 21/35 = .6 accuracy, which our classifier soundly outperforms.  In conclusion, this combination of feature selection and tuning parameters maintains desirable statistical properties - stationarity and memory retention - while also attaining solid practical results.

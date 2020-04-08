@@ -1,0 +1,295 @@
+---
+title: "hw-4-nc7"
+author: "Nicholas Chen"
+date: "March 17, 2019"
+output: html_document
+---
+```{r setup, include=FALSE}
+library(TTR)
+library(randomForest)
+library(ROCR)
+library(pROC)
+options(warn=-1)
+```
+
+# 1. Some functions from previous assignments
+
+```{r func_def}
+fracDiff = function(datc, d=.5, tau=.0001){
+  w_n = 1
+  w = 1
+  while (abs(w_n) > tau && length(w) < length(datc)){
+    k = length(w)
+    w_n = -1*w_n*(d-k+1)/k
+    if (abs(w_n) > tau){
+      w = c(w,w_n)
+    }
+  }
+  
+  fracD = rep(0, length(datc))
+  
+  for(i in 1:length(datc)){
+    temp = 0
+    for(j in 1:length(w)){
+      if (j==i){break}
+      temp = temp + datc[i-j+1] * w[j]
+    }
+    fracD[i] = temp
+  }
+  
+  fracD[length(w):length(fracD)]
+  
+}
+
+
+cusum <- function(dat, h){
+  
+  d_p = rep(0, length(dat))
+  
+  for( i in 2:length(d_p)){
+    d_p[i] = dat[i]-dat[i-1]
+  }
+  
+  s_plus = 0
+  s_minus = 0
+  samples = rep(0,length(dat))
+  for(i in 1:length(d_p)){
+    s_plus = s_plus + d_p[i]
+    s_minus = s_minus + d_p[i]
+    s_plus = max(s_plus, 0)
+    s_minus = min(s_minus, 0)
+    
+    if (s_plus > h){
+      samples[i] = 1
+      s_plus = 0
+      s_minus = 0
+    }
+    
+    if (s_minus < -1 * h){
+      samples[i] = 1
+      s_plus = 0
+      s_minus = 0
+    }
+  }
+  which(samples > 0)
+}
+
+triple_barrier <- function(dat, pts1 = c(1,1), t1 = 4, trgt = 1.5){
+  n = as.integer(length(dat)/t1)
+  labels = rep(0,n)
+  break_idx = rep(-1,n)
+  closes = rep(0,n)
+  for (i in 1:n){
+    start_idx = (i-1)*t1 + 1
+    start_p = dat[start_idx]
+    for (j in start_idx:min(length(dat),start_idx+t1)){
+      if (dat[j]>(start_p+pts1[1]*trgt)){
+        labels[i] = 1
+        break_idx[i] = j
+        break
+      }
+      
+      if (dat[j]<(start_p-pts1[2]*trgt)){
+        labels[i] = -1
+        break_idx[i] = j
+        break
+      }
+    }
+    
+    if (labels[i] == 0){
+      break_idx[i] = j
+    }
+    closes[i] = dat[j]
+  }
+  list(l=labels,i=break_idx, c = closes)
+}
+```
+
+#2. Load data previously computed during preprocessing step
+
+```{r load_roll}
+base = -1
+
+days = c(1,2,3,4,7,8,9,10,11,14,15,16,17,18)
+
+dat = -1
+for(i in days){
+  if (i < 11){
+    tmp = read.csv(paste('./datasets/algoseek/out/',i,'ESH6M1.csv', sep = ''))
+  }else{
+    tmp = read.csv(paste('./datasets/algoseek/out/',i,'ESM6M1.csv', sep = ''))
+  }
+  if(i==10){
+    
+    base=(tmp$vwap1_buy[dim(tmp)[1]] + tmp$vwap1_sell[dim(tmp)[1]])/2
+  }
+  if(i == 11){
+    roll_ratio = (tmp$vwap1_buy[1] + tmp$vwap1_sell[1])/2 / base
+  }
+  
+  if(i >= 11){
+    tmp = tmp / roll_ratio
+  }
+  if(dat==-1){
+    dat = tmp
+  }else{
+    dat = rbind(dat,tmp)
+  }
+}
+
+fracD = apply(dat[,3:22], 2, fracDiff)
+fracD = data.frame(apply(fracD,2,function(i){i = (i - mean(i))/sd(i) }))
+```
+
+As indicated, I precompute some preprocessing steps - discretizing the data into 1 minute windows each day.  Unshown preprocessing code credit to Professor Hua.  I then adjust futures prices after 3/10 via ratio rollover, taking the ratio of close price on 3/10 to the open price on 3/11.
+
+
+#3. Grid search for optimal hyperparameters
+
+```{r grid_search}
+
+mid = (fracD$vwap1_buy + fracD$vwap1_sell)/2
+
+h_vals = c(1:10)
+h_vals = h_vals / 5 + .2
+
+t_vals = c(1:10)
+t_vals = t_vals / 4
+
+hyper_scores = matrix(nrow=10,ncol=10)
+
+for(j in c(1:10)){
+  for(k in c(1:10)){
+  h=h_vals[j]
+  t = t_vals[k]
+  cusum_idx = cusum(mid, h)
+  
+  c_prices = rep(0, length(cusum_idx))
+  c_fracD = rep(0, length(cusum_idx))
+  
+  c_fracD = fracD[cusum_idx,]
+  c_prices = mid[cusum_idx]
+  
+  labels = triple_barrier(c_prices, trgt=t)
+  
+  metalabels = rep(0, length(labels[['l']]))
+  for(i in 1:length(metalabels)){
+    if(labels[['l']][i] == 1){
+      metalabels[i]=1
+    }
+  }
+  metalabels = as.factor(metalabels)
+  
+  features=data.frame(y=metalabels,c_fracD[labels$i,])
+  
+  i = as.integer(dim(features)[1]/4)
+  f1 = 0
+  for(n in c(1:4)){
+    lower = (n-1)*i+1
+    upper = lower + i-1
+    train = features[lower:upper,]
+    test = features[-(lower:upper),]
+    
+    x = randomForest(train[,-1], y=train$y, 
+                     xtest = test[,-1], ytest = test$y,
+                     importance = TRUE)
+    
+    conf = x$test$confusion
+    
+    precision = conf[2,2]/(conf[2,2] + conf[1,2])
+    recall = conf[2,2]/(conf[2,2]+conf[2,1])
+    f1 = f1 + 2*precision*recall/(precision+recall)
+  }
+  hyper_scores[j,k] = f1/4
+  
+  }
+}
+```
+
+We now want to apply a CUSUM filter then metalabeling via the triple barrier method.  I use exhaustive grid search over our two main hyper-parameters - h for the cusum filter and target price for triple barrier labeling.  I picked a range of values that would keep the number of data items at around 100 for the random forest algorithm.
+
+I measure performance using 4-fold cross validation.  That is, for each combination of hyper-parameters, I train 4 random forests with 4 disjoint test sets of equal size.  I compute f1 scores for each classifier, then track the average f1 score for each combination.
+
+```{r hyper_scores}
+hyper_scores
+```
+
+Based on these results, we have multiple combinations that achieve similar performance; I just eyeballed it to pick an entry that seemed locally stable with high performance: h = (10) / 5 + .2 = 2.2 and t = (4)/4 = 1.0.
+
+#4. Performance analysis
+
+```{r results}
+
+mid = (fracD$vwap1_buy + fracD$vwap1_sell)/2
+h = 2.2
+t = 1
+
+cusum_idx = cusum(mid, h)
+
+c_prices = rep(0, length(cusum_idx))
+c_fracD = rep(0, length(cusum_idx))
+
+c_fracD = fracD[cusum_idx,]
+c_prices = mid[cusum_idx]
+
+labels = triple_barrier(c_prices, trgt=t)
+
+metalabels = rep(0, length(labels[['l']]))
+for(i in 1:length(metalabels)){
+  if(labels[['l']][i] == 1){
+    metalabels[i]=1
+  }
+}
+metalabels = as.factor(metalabels)
+
+features=data.frame(y=metalabels,c_fracD[labels$i,])
+
+i = as.integer(dim(features)[1]/3)*2
+f1 = 0
+train = features[1:i,]
+test = features[-(1:i),]
+
+x = randomForest(train[,-1], y=train$y, 
+                 xtest = test[,-1], ytest = test$y,
+                 importance = TRUE)
+varImpPlot(x)
+
+x$test$confusion
+predictions = as.vector(x$test$votes[,2])
+pred = prediction(predictions,test$y)
+perf_AUC = performance(pred, "auc")
+auc = perf_AUC@y.values[[1]]
+auc
+
+perf = performance(pred, "tpr","fpr")
+plot.new()
+suppressWarnings(plot(perf@x.values[[1]], perf@y.values[[1]], main = 'ROC Curve', col = 'blue',add=TRUE, xlab = 'False Positive', ylab = 'True Positive')) 
+abline(c(0,0), c(1,1))
+```
+
+This model ties majority guess; unfortunately, my computer can't handle a very large range of data, and the last third of this date range was extremely imbalanced.  In my opinion, this is an acceptable cost.  I chose to use k-fold cross validation during grid search, rather than only measuring performance on the real 'test' set (the last fold) in order to avoid overfitting.  Our F1 and AUC results are great and the predictor gave a balanced classification.  So even though it's performance isn't particularly stellar on the final portion of the time series data, I expect it to generalize better than other hyperparameter combinations which is critical for financial problems.
+
+# 5. Trying feature selection
+```{r feature_Selection}
+x = randomForest(train[,-c(1,7,14,15,16,17,21,22)], y=train$y, 
+                 xtest = test[,-c(1,7,14,15,16,17,21,22)], ytest = test$y,
+                 importance = TRUE)
+
+x$test$confusion
+predictions = as.vector(x$test$votes[,2])
+pred = prediction(predictions,test$y)
+perf_AUC = performance(pred, "auc")
+auc = perf_AUC@y.values[[1]]
+auc
+
+
+
+perf = performance(pred, "tpr","fpr")
+plot.new()
+suppressWarnings(plot(perf@x.values[[1]], perf@y.values[[1]], main = 'ROC Curve', col = 'blue',add=TRUE, xlab = 'False Positive', ylab = 'True Positive')) 
+abline(c(0,0), c(1,1))
+```
+
+Finally, I tried applying feature importance to prune features.  However, due to the high correlation between the features, they're most interchangeable and MDA/MDG rankings tend to vary randomly every iteration.  I took the 8 features with lowest MDA from one forest, dropped them, and built a new random forest model.  It didn't change a single decision, heavily implying that feature selection will not help in this case.
+
+Regardless, the vwap features in tandem with grid search yielded surprisingly high f1 scores and AUC.  I would love to repeat this study on a higher-power computer to see if such a model scaled well to a larger dataset, or if its success merely captured an incidental short term quirk. 
